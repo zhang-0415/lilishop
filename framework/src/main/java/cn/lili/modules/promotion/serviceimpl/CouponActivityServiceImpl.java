@@ -29,7 +29,7 @@ import cn.lili.trigger.model.TimeExecuteConstant;
 import cn.lili.trigger.model.TimeTriggerMsg;
 import cn.lili.trigger.util.DelayQueueTools;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import groovy.util.logging.Slf4j;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -46,8 +46,8 @@ import java.util.stream.Collectors;
  * @author Bulbasaur
  * @since 2021/5/20 6:10 下午
  */
-@Slf4j
 @Service
+@Slf4j
 public class CouponActivityServiceImpl extends AbstractPromotionsServiceImpl<CouponActivityMapper, CouponActivity> implements CouponActivityService {
 
     @Autowired
@@ -227,15 +227,18 @@ public class CouponActivityServiceImpl extends AbstractPromotionsServiceImpl<Cou
         /**
          * 自动发送优惠券则需要补足日志
          */
-        if (couponActivityTrigger.getCouponActivityTypeEnum().equals(CouponActivityTypeEnum.AUTO_COUPON)) {
+        if (couponActivityTrigger.getCouponActivityTypeEnum().equals(CouponActivityTypeEnum.AUTO_COUPON) || couponActivityTrigger.getCouponActivityTypeEnum().equals(CouponActivityTypeEnum.SPECIFY)) {
             couponActivities = memberCouponSignService.receiveCoupon(couponActivities);
         }
 
+
         //优惠券发放列表
+        log.info("当前用户的优惠券活动信息:{}", couponActivityTrigger);
+        log.info("当前进行的优惠券活动:{}", couponActivities);
         List<CouponActivityItemVO> couponActivityItemVOS = new ArrayList<>();
 
         //准备发放优惠券活动的列表
-        couponActivities.stream().forEach(item -> couponActivityItemVOS.addAll(item.getCouponActivityItems()));
+        couponActivities.forEach(item -> couponActivityItemVOS.addAll(item.getCouponActivityItems()));
 
         AuthUser authUser = new AuthUser();
         authUser.setId(couponActivityTrigger.getUserId());

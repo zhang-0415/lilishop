@@ -18,6 +18,10 @@ import cn.lili.modules.order.order.entity.enums.OrderItemAfterSaleStatusEnum;
 import cn.lili.modules.order.order.entity.enums.OrderStatusEnum;
 import cn.lili.modules.order.order.service.OrderItemService;
 import cn.lili.modules.order.order.service.OrderService;
+import cn.lili.modules.order.order.service.StoreFlowService;
+import cn.lili.modules.store.entity.dto.StoreSettlementDay;
+import cn.lili.modules.store.service.BillService;
+import cn.lili.modules.store.service.StoreDetailService;
 import cn.lili.modules.system.entity.dos.Setting;
 import cn.lili.modules.system.entity.dto.OrderSetting;
 import cn.lili.modules.system.entity.enums.SettingEnum;
@@ -25,12 +29,13 @@ import cn.lili.modules.system.service.SettingService;
 import cn.lili.timetask.handler.EveryDayExecute;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
-
 import java.util.List;
 import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.messaging.handler.annotation.SendTo;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 /**
  * @author paulG
@@ -65,6 +70,20 @@ public class OrderEveryDayTaskExecute implements EveryDayExecute {
     @Autowired
     private DistributionOrderService distributionOrderService;
 
+    @Autowired
+    private StoreFlowService storeFlowService;
+
+    /**
+     * 结算单
+     */
+    @Autowired
+    private BillService billService;
+    /**
+     * 店铺详情
+     */
+    @Autowired
+    private StoreDetailService storeDetailService;
+
     /**
      * 执行每日任务
      */
@@ -92,7 +111,7 @@ public class OrderEveryDayTaskExecute implements EveryDayExecute {
         }
         try {
             //关闭允许售后申请
-            closeAfterSale(orderSetting);
+            this.closeAfterSale(orderSetting);
         } catch (Exception e) {
             log.error(e.getMessage(), e);
         }
@@ -102,6 +121,22 @@ public class OrderEveryDayTaskExecute implements EveryDayExecute {
         } catch (Exception e) {
             log.error(e.getMessage(), e);
         }
+
+        //修改分账状态
+        try {
+            storeFlowService.updateProfitSharingStatus();
+        } catch (Exception e) {
+            log.error("修改分账状态失败", e);
+        }
+
+        //生成店铺结算单
+        try {
+            createBill();
+        } catch (Exception e) {
+            log.error("生成店铺结算单", e);
+        }
+
+
     }
 
     /**
@@ -110,7 +145,6 @@ public class OrderEveryDayTaskExecute implements EveryDayExecute {
      * @param orderSetting 订单设置
      */
     private void completedOrder(OrderSetting orderSetting) {
-
 
         //订单自动收货时间 = 当前时间 - 自动收货时间天数
         DateTime receiveTime = DateUtil.offsetDay(DateUtil.date(), -orderSetting.getAutoReceive());
@@ -144,7 +178,9 @@ public class OrderEveryDayTaskExecute implements EveryDayExecute {
         DateTime receiveTime = DateUtil.offsetDay(DateUtil.date(), -orderSetting.getAutoEvaluation());
 
         //订单完成时间 <= 订单自动好评时间
-        OrderItemOperationDTO orderItemOperationDTO = OrderItemOperationDTO.builder().receiveTime(receiveTime).commentStatus(CommentStatusEnum.UNFINISHED.name()).build();
+        OrderItemOperationDTO orderItemOperationDTO =
+            OrderItemOperationDTO.builder().receiveTime(receiveTime).commentStatus(CommentStatusEnum.UNFINISHED.name())
+                .build();
         List<OrderItem> orderItems = orderItemService.waitOperationOrderItem(orderItemOperationDTO);
 
         //判断是否有符合条件的订单，进行自动评价处理
@@ -170,45 +206,21 @@ public class OrderEveryDayTaskExecute implements EveryDayExecute {
         }
     }
 
-
     /**
      * 关闭允许售后申请
      *
      * @param orderSetting 订单设置
      */
-    private void closeAfterSale(OrderSetting orderSetting) {
-        //为0则不限制
-        if (orderSetting.getCloseAfterSale() == null || orderSetting.getCloseAfterSale() == 0) {
-            return;
-        }
+    @Transactional(rollbackFor = Exception.class)
+    public void closeAfterSale(OrderSetting orderSetting) {
         //订单关闭售后申请时间 = 当前时间 - 自动关闭售后申请天数
         DateTime receiveTime = DateUtil.offsetDay(DateUtil.date(), -orderSetting.getCloseAfterSale());
+
+//        OrderItemOperationDTO build = OrderItemOperationDTO.builder().receiveTime(receiveTime)
+//            .afterSaleStatus(OrderItemAfterSaleStatusEnum.NOT_APPLIED.name()).build();
+//        List<OrderItem> orderItems = orderItemService.waitOperationOrderItem(build);
         //关闭售后订单=未售后订单+小于订单关闭售后申请时间
-        OrderItemOperationDTO build = OrderItemOperationDTO.builder().receiveTime(receiveTime).afterSaleStatus(OrderItemAfterSaleStatusEnum.NOT_APPLIED.name()).build();
-        List<OrderItem> orderItems = orderItemService.waitOperationOrderItem(build);
-
-        //判断是否有符合条件的订单，关闭允许售后申请处理
-        if (!orderItems.isEmpty()) {
-
-            //获取订单货物ID
-            List<String> orderItemIdList = orderItems.stream().map(OrderItem::getId).collect(Collectors.toList());
-
-            //修改订单售后状态
-            LambdaUpdateWrapper<OrderItem> lambdaUpdateWrapper = new LambdaUpdateWrapper<OrderItem>()
-                    .set(OrderItem::getAfterSaleStatus, OrderItemAfterSaleStatusEnum.EXPIRED.name())
-                    .in(OrderItem::getId, orderItemIdList);
-            orderItemService.update(lambdaUpdateWrapper);
-            orderItemService.expiredAfterSaleStatusExecuteByAfterSale(receiveTime);
-            //修改订售后状态
-            List<OrderItem> orderItemsList = orderItems.stream()
-                    .map((orderItem) -> {
-                        orderItem.setAfterSaleStatus(OrderItemAfterSaleStatusEnum.EXPIRED.name());
-                        return orderItem;
-                    })
-                    .collect(Collectors.toList());
-            //修改对应分销订单状态
-            distributionOrderService.updateDistributionOrderStatus(orderItemsList);
-        }
+        orderItemService.expiredAfterSaleStatus(receiveTime);
 
     }
 
@@ -227,7 +239,8 @@ public class OrderEveryDayTaskExecute implements EveryDayExecute {
         DateTime receiveTime = DateUtil.offsetDay(DateUtil.date(), -orderSetting.getCloseComplaint());
 
         //关闭售后订单=未售后订单+小于订单关闭售后申请时间
-        OrderItemOperationDTO build = OrderItemOperationDTO.builder().receiveTime(receiveTime).complainStatus(OrderComplaintStatusEnum.NO_APPLY.name()).build();
+        OrderItemOperationDTO build = OrderItemOperationDTO.builder().receiveTime(receiveTime)
+            .complainStatus(OrderComplaintStatusEnum.NO_APPLY.name()).build();
         List<OrderItem> orderItems = orderItemService.waitOperationOrderItem(build);
 
         //判断是否有符合条件的订单，关闭允许售后申请处理
@@ -237,12 +250,37 @@ public class OrderEveryDayTaskExecute implements EveryDayExecute {
             List<String> orderItemIdList = orderItems.stream().map(OrderItem::getId).collect(Collectors.toList());
 
             //修改订单投诉状态
-            LambdaUpdateWrapper<OrderItem> lambdaUpdateWrapper = new LambdaUpdateWrapper<OrderItem>()
-                    .set(OrderItem::getComplainStatus, OrderItemAfterSaleStatusEnum.EXPIRED.name())
-                    .in(OrderItem::getId, orderItemIdList);
+            LambdaUpdateWrapper<OrderItem> lambdaUpdateWrapper =
+                new LambdaUpdateWrapper<OrderItem>().set(OrderItem::getComplainStatus,
+                    OrderItemAfterSaleStatusEnum.EXPIRED.name()).in(OrderItem::getId, orderItemIdList);
             orderItemService.update(lambdaUpdateWrapper);
         }
 
+    }
+
+    /**
+     * 1.查询今日待结算的商家
+     * 2.查询商家上次结算日期，生成本次结算单
+     * 3.记录商家结算日
+     */
+    private void createBill() {
+        //获取当前天数
+        int day = DateUtil.date().dayOfMonth();
+
+        //获取待结算商家列表
+        List<StoreSettlementDay> storeList = storeDetailService.getSettlementStore(day);
+
+        //获取当前时间
+        DateTime endTime = DateUtil.date();
+        //批量商家结算
+        for (StoreSettlementDay storeSettlementDay : storeList) {
+
+            //生成结算单
+            billService.createBill(storeSettlementDay.getStoreId(), storeSettlementDay.getSettlementDay(), endTime);
+
+            //修改店铺结算时间
+            storeDetailService.updateSettlementDay(storeSettlementDay.getStoreId(), endTime);
+        }
     }
 
 }

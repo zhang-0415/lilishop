@@ -207,8 +207,9 @@ public class OrderStoreController {
 
     @ApiOperation(value = "查询订单导出列表")
     @GetMapping("/queryExportOrder")
-    public ResultMessage<List<OrderExportDTO>> queryExportOrder(OrderSearchParams orderSearchParams) {
-        return ResultUtil.data(orderService.queryExportOrder(orderSearchParams));
+    public void queryExportOrder(OrderSearchParams orderSearchParams) {
+        HttpServletResponse response = ThreadContextHolder.getHttpResponse();
+        orderService.queryExportOrder(response,orderSearchParams);
     }
 
     @PreventDuplicateSubmissions
@@ -250,5 +251,12 @@ public class OrderStoreController {
     @PostMapping(value = "/{orderSn}/partDelivery")
     public ResultMessage<Object> delivery(@RequestBody PartDeliveryParamsDTO partDeliveryParamsDTO) {
         return ResultUtil.data(orderService.partDelivery(partDeliveryParamsDTO));
+    }
+
+    @ApiOperation(value = "卖家订单备注")
+    @PutMapping("/{orderSn}/sellerRemark")
+    public ResultMessage<Object> sellerRemark(@PathVariable String orderSn, @RequestParam String sellerRemark) {
+        orderService.updateSellerRemark(orderSn, sellerRemark);
+        return ResultUtil.success();
     }
 }

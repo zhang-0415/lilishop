@@ -89,6 +89,7 @@ public enum ResultCode {
     VIRTUAL_GOODS_NOT_NEED_TEMP(11015, "虚拟商品无需选择配送模板"),
     GOODS_NOT_EXIST_STORE(11017, "当前用户无权操作此商品"),
     GOODS_TYPE_ERROR(11016, "需选择商品类型"),
+    GOODS_STOCK_IMPORT_ERROR(11018, "导入商品库存失败，请检查表格数据"),
 
     /**
      * 参数
@@ -173,6 +174,7 @@ public enum ResultCode {
     DISTRIBUTION_RETREAT_ERROR(22004, "分销员清退失败"),
     DISTRIBUTION_CASH_NOT_EXIST(22005, "分销员提现记录不存在"),
     DISTRIBUTION_GOODS_DOUBLE(22006, "不能重复添加分销商品"),
+    DISTRIBUTION_EDIT_ERROR(22007, "修改分销员失败"),
 
     /**
      * 购物车

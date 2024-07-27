@@ -4,10 +4,12 @@ import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.date.DateUtil;
 import cn.hutool.core.io.IoUtil;
 import cn.hutool.core.text.CharSequenceUtil;
+import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import cn.hutool.poi.excel.ExcelReader;
 import cn.hutool.poi.excel.ExcelUtil;
 import cn.hutool.poi.excel.ExcelWriter;
+import cn.lili.common.enums.ClientTypeEnum;
 import cn.lili.common.enums.PromotionTypeEnum;
 import cn.lili.common.enums.ResultCode;
 import cn.lili.common.event.TransactionCommitSendMQEvent;
@@ -16,6 +18,7 @@ import cn.lili.common.properties.RocketmqCustomProperties;
 import cn.lili.common.security.OperationalJudgment;
 import cn.lili.common.security.context.UserContext;
 import cn.lili.common.security.enums.UserEnums;
+import cn.lili.common.utils.CurrencyUtil;
 import cn.lili.common.utils.SnowFlake;
 import cn.lili.modules.goods.entity.dto.GoodsCompleteMessage;
 import cn.lili.modules.member.entity.dto.MemberAddressDTO;
@@ -40,8 +43,12 @@ import cn.lili.modules.store.entity.dto.StoreDeliverGoodsAddressDTO;
 import cn.lili.modules.store.service.StoreDetailService;
 import cn.lili.modules.system.aspect.annotation.SystemLogPoint;
 import cn.lili.modules.system.entity.dos.Logistics;
+import cn.lili.modules.system.entity.dos.Setting;
+import cn.lili.modules.system.entity.dto.OrderSetting;
+import cn.lili.modules.system.entity.enums.SettingEnum;
 import cn.lili.modules.system.entity.vo.Traces;
 import cn.lili.modules.system.service.LogisticsService;
+import cn.lili.modules.system.service.SettingService;
 import cn.lili.mybatis.util.PageUtil;
 import cn.lili.rocketmq.RocketmqSendCallbackBuilder;
 import cn.lili.rocketmq.tags.GoodsTagsEnum;
@@ -60,7 +67,11 @@ import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.util.CellRangeAddressList;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationEventPublisher;
@@ -153,6 +164,10 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
      */
     @Autowired
     private OrderPackageItemService orderPackageItemService;
+
+    @Autowired
+    private SettingService settingService;
+
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -276,8 +291,26 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     }
 
     @Override
-    public List<OrderExportDTO> queryExportOrder(OrderSearchParams orderSearchParams) {
-        return this.baseMapper.queryExportOrder(orderSearchParams.queryWrapper());
+    public void queryExportOrder(HttpServletResponse response, OrderSearchParams orderSearchParams) {
+
+        XSSFWorkbook workbook = initOrderExportData(this.baseMapper.queryExportOrder(orderSearchParams.queryWrapper()));
+        try {
+            // 设置响应头
+            String fileName = URLEncoder.encode("订单列表", "UTF-8");
+            response.setContentType("application/vnd.ms-excel;charset=UTF-8");
+            response.setHeader("Content-Disposition", "attachment;filename=" + fileName + ".xlsx");
+
+            ServletOutputStream out = response.getOutputStream();
+            workbook.write(out);
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            try {
+                workbook.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
     }
 
     @Override
@@ -303,7 +336,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         Order order = OperationalJudgment.judgment(this.getBySn(orderSn));
         //如果订单促销类型不为空&&订单是拼团订单，并且订单未成团，则抛出异常
         if (OrderPromotionTypeEnum.PINTUAN.name().equals(order.getOrderPromotionType())
-                && !CharSequenceUtil.equalsAny(order.getOrderStatus(), OrderStatusEnum.TAKE.name(), OrderStatusEnum.UNDELIVERED.name(), OrderStatusEnum.STAY_PICKED_UP.name())) {
+                && !CharSequenceUtil.equalsAny(order.getOrderStatus(), OrderStatusEnum.TAKE.name(), OrderStatusEnum.UNDELIVERED.name(),
+                OrderStatusEnum.STAY_PICKED_UP.name())) {
             throw new ServiceException(ResultCode.ORDER_CAN_NOT_CANCEL);
         }
         if (CharSequenceUtil.equalsAny(order.getOrderStatus(),
@@ -318,7 +352,8 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
             //修改订单
             this.updateById(order);
             //生成店铺退款流水
-            this.generatorStoreRefundFlow(order);
+            storeFlowService.orderCancel(orderSn);
+            //发送消息
             orderStatusMessage(order);
             return order;
         } else {
@@ -330,14 +365,14 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     @Override
     @OrderLogPoint(description = "'订单['+#orderSn+']系统取消，原因为：'+#reason", orderSn = "#orderSn")
     @Transactional(rollbackFor = Exception.class)
-    public void systemCancel(String orderSn, String reason,Boolean refundMoney) {
+    public void systemCancel(String orderSn, String reason, Boolean refundMoney) {
         Order order = this.getBySn(orderSn);
         order.setOrderStatus(OrderStatusEnum.CANCELLED.name());
         order.setCancelReason(reason);
         this.updateById(order);
-        if(refundMoney){
+        if (refundMoney) {
             //生成店铺退款流水
-            this.generatorStoreRefundFlow(order);
+            storeFlowService.orderCancel(orderSn);
             orderStatusMessage(order);
         }
     }
@@ -526,10 +561,14 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     @Override
     public Order getOrderByVerificationCode(String verificationCode) {
         String storeId = Objects.requireNonNull(UserContext.getCurrentUser()).getStoreId();
-        return this.getOne(new LambdaQueryWrapper<Order>()
+        Order order = this.getOne(new LambdaQueryWrapper<Order>()
                 .in(Order::getOrderStatus, OrderStatusEnum.TAKE.name(), OrderStatusEnum.STAY_PICKED_UP.name())
                 .eq(Order::getStoreId, storeId)
                 .eq(Order::getVerificationCode, verificationCode));
+        if (order == null) {
+            throw new ServiceException(ResultCode.ORDER_TAKE_ERROR);
+        }
+        return order;
     }
 
     @Override
@@ -558,11 +597,14 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     @Transactional(rollbackFor = Exception.class)
     public void complete(Order order, String orderSn) {//修改订单状态为完成
         this.updateStatus(orderSn, OrderStatusEnum.COMPLETED);
-
         //修改订单货物可以进行评价
         orderItemService.update(new UpdateWrapper<OrderItem>().eq(ORDER_SN_COLUMN, orderSn)
                 .set("comment_status", CommentStatusEnum.UNFINISHED));
         this.update(new LambdaUpdateWrapper<Order>().eq(Order::getSn, orderSn).set(Order::getCompleteTime, new Date()));
+
+        //修改订单投诉状态
+        updateOrderComplainStatus(orderSn);
+
         //发送订单状态改变消息
         OrderMessage orderMessage = new OrderMessage();
         orderMessage.setNewStatus(OrderStatusEnum.COMPLETED);
@@ -646,7 +688,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
             this.pintuanOrderSuccess(list);
         } else if (Boolean.FALSE.equals(pintuan.getFictitious()) && pintuan.getRequiredNum() > list.size()) {
             //如果未开启虚拟成团且当前订单数量不足成团数量，则认为拼团失败
-            this.pintuanOrderFailed(list);
+            this.pintuanOrderFailed(parentOrderSn);
         }
     }
 
@@ -782,12 +824,12 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
                 //如果未开启虚拟成团且已参团人数小于成团人数，则自动取消订单
                 String reason = "拼团活动结束订单未付款，系统自动取消订单";
                 if (CharSequenceUtil.isNotEmpty(entry.getKey())) {
-                    this.systemCancel(entry.getKey(), reason,true);
+                    this.systemCancel(entry.getKey(), reason, true);
                 } else {
                     for (Order order : entry.getValue()) {
                         if (!CharSequenceUtil.equalsAny(order.getOrderStatus(), OrderStatusEnum.COMPLETED.name(), OrderStatusEnum.DELIVERED.name(),
                                 OrderStatusEnum.TAKE.name(), OrderStatusEnum.STAY_PICKED_UP.name())) {
-                            this.systemCancel(order.getSn(), reason,true);
+                            this.systemCancel(order.getSn(), reason, true);
                         }
                     }
                 }
@@ -841,7 +883,9 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
                     orderPackageItem.setGoodsName(orderItem.getGoodsName());
                     orderPackageItem.setThumbnail(orderItem.getImage());
                     orderPackageItemService.save(orderPackageItem);
-                    OrderLog orderLog = new OrderLog(orderSn, UserContext.getCurrentUser().getId(), UserContext.getCurrentUser().getRole().getRole(), UserContext.getCurrentUser().getUsername(), "订单 [ " + orderSn + " ]商品 [ " + orderItem.getGoodsName() + " ]发货，发货数量: [ " + partDeliveryDTO.getDeliveryNum() + " ]，发货单号[ " + invoiceNumber + " ]");
+                    OrderLog orderLog = new OrderLog(orderSn, UserContext.getCurrentUser().getId(),
+                            UserContext.getCurrentUser().getRole().getRole(), UserContext.getCurrentUser().getUsername(), "订单 [ " + orderSn + " ]商品" +
+                            " [ " + orderItem.getGoodsName() + " ]发货，发货数量: [ " + partDeliveryDTO.getDeliveryNum() + " ]，发货单号[ " + invoiceNumber + " ]");
                     orderLogList.add(orderLog);
                 }
             }
@@ -866,6 +910,14 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         return order;
     }
 
+    @Override
+    public Order updateSellerRemark(String orderSn, String sellerRemark) {
+        Order order = this.getBySn(orderSn);
+        order.setSellerRemark(sellerRemark);
+        this.updateById(order);
+        return order;
+    }
+
     /**
      * 虚拟成团
      *
@@ -880,7 +932,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         //未付款订单自动取消
         if (unpaidOrders != null && !unpaidOrders.isEmpty()) {
             for (Order unpaidOrder : unpaidOrders) {
-                this.systemCancel(unpaidOrder.getSn(), "拼团活动结束订单未付款，系统自动取消订单",false);
+                this.systemCancel(unpaidOrder.getSn(), "拼团活动结束订单未付款，系统自动取消订单", false);
             }
         }
         List<Order> paidOrders = listMap.get(PayStatusEnum.PAID.name());
@@ -928,24 +980,24 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         this.sendUpdateStatusMessage(orderMessage);
     }
 
-    /**
-     * 生成店铺退款流水
-     *
-     * @param order 订单信息
-     */
-    private void generatorStoreRefundFlow(Order order) {
-        // 判断订单是否是付款
-        if (!PayStatusEnum.PAID.name().equals((order.getPayStatus()))) {
-            return;
-        }
-        List<OrderItem> items = orderItemService.getByOrderSn(order.getSn());
-        List<StoreFlow> storeFlows = new ArrayList<>();
-        for (OrderItem item : items) {
-            StoreFlow storeFlow = new StoreFlow(order, item, FlowTypeEnum.REFUND);
-            storeFlows.add(storeFlow);
-        }
-        storeFlowService.saveBatch(storeFlows);
-    }
+//    /**
+//     * 生成店铺退款流水
+//     *
+//     * @param order 订单信息
+//     */
+//    private void generatorStoreRefundFlow(Order order) {
+//        // 判断订单是否是付款
+//        if (!PayStatusEnum.PAID.name().equals((order.getPayStatus()))) {
+//            return;
+//        }
+//        List<OrderItem> items = orderItemService.getByOrderSn(order.getSn());
+//        List<StoreFlow> storeFlows = new ArrayList<>();
+//        for (OrderItem item : items) {
+//            StoreFlow storeFlow = new StoreFlow(order, item, FlowTypeEnum.REFUND);
+//            storeFlows.add(storeFlow);
+//        }
+//        storeFlowService.saveBatch(storeFlows);
+//    }
 
     /**
      * 此方法只提供内部调用，调用前应该做好权限处理
@@ -1037,12 +1089,13 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
     /**
      * 根据提供的拼团订单列表更新拼团状态为拼团失败
      *
-     * @param list 需要更新拼团状态为失败的拼团订单列表
+     * @param parentOrderSn 拼团订单sn
      */
-    private void pintuanOrderFailed(List<Order> list) {
+    private void pintuanOrderFailed(String parentOrderSn) {
+        List<Order> list = this.list(new LambdaQueryWrapper<Order>().eq(Order::getParentOrderSn, parentOrderSn).or().eq(Order::getSn, parentOrderSn));
         for (Order order : list) {
             try {
-                this.systemCancel(order.getSn(), "拼团人数不足，拼团失败！",true);
+                this.systemCancel(order.getSn(), "拼团人数不足，拼团失败！", true);
             } catch (Exception e) {
                 log.error("拼团订单取消失败", e);
             }
@@ -1135,5 +1188,156 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         if (!verificationCode.equals(order.getVerificationCode())) {
             throw new ServiceException(ResultCode.ORDER_TAKE_ERROR);
         }
+    }
+
+    /**
+     * 根据订单设置修改订单投诉状态
+     *
+     * @param orderSn
+     */
+    private void updateOrderComplainStatus(String orderSn) {
+        Setting setting = settingService.get(SettingEnum.ORDER_SETTING.name());
+        //订单设置
+        OrderSetting orderSetting = JSONUtil.toBean(setting.getSettingValue(), OrderSetting.class);
+        if (orderSetting == null) {
+            return;
+        }
+        //设置投诉天数大于0 则走每日定时任务处理，=0 则即可关闭订单的投诉状态
+        if (orderSetting.getCloseComplaint() > 0) {
+            return;
+        }
+        //关闭订单投诉状态
+        LambdaUpdateWrapper<OrderItem> lambdaUpdateWrapper = new LambdaUpdateWrapper<OrderItem>()
+                .eq(OrderItem::getOrderSn, orderSn)
+                .set(OrderItem::getComplainStatus, OrderComplaintStatusEnum.EXPIRED.name());
+        orderItemService.update(lambdaUpdateWrapper);
+    }
+
+    /**
+     * 初始化填充订单导出数据
+     *
+     * @param orderExportDTOList 导出的订单数据
+     * @return 订单导出列表
+     */
+    private XSSFWorkbook initOrderExportData(List<OrderExportDTO> orderExportDTOList) {
+        List<OrderExportDetailDTO> orderExportDetailDTOList = new ArrayList<>();
+        for (OrderExportDTO orderExportDTO : orderExportDTOList) {
+            OrderExportDetailDTO orderExportDetailDTO = new OrderExportDetailDTO();
+            BeanUtil.copyProperties(orderExportDTO, orderExportDetailDTO);
+            //金额
+            PriceDetailDTO priceDetailDTO = JSONUtil.toBean(orderExportDTO.getPriceDetail(), PriceDetailDTO.class);
+            orderExportDetailDTO.setFreightPrice(priceDetailDTO.getFreightPrice());
+            orderExportDetailDTO.setDiscountPrice(CurrencyUtil.add(priceDetailDTO.getDiscountPrice(), priceDetailDTO.getCouponPrice()));
+            orderExportDetailDTO.setUpdatePrice(priceDetailDTO.getUpdatePrice());
+            orderExportDetailDTO.setStoreMarketingCost(priceDetailDTO.getSiteCouponCommission());
+            orderExportDetailDTO.setSiteMarketingCost(CurrencyUtil.sub(orderExportDetailDTO.getDiscountPrice(), orderExportDetailDTO.getStoreMarketingCost()));
+            //地址
+            if (StrUtil.isNotBlank(orderExportDTO.getConsigneeAddressPath())) {
+                String[] receiveAddress = orderExportDTO.getConsigneeAddressPath().split(",");
+                orderExportDetailDTO.setProvince(receiveAddress[0]);
+                orderExportDetailDTO.setCity(receiveAddress.length > 1 ?receiveAddress[1]:"");
+                orderExportDetailDTO.setDistrict(receiveAddress.length > 2 ? receiveAddress[2] : "");
+                orderExportDetailDTO.setStreet(receiveAddress.length > 3 ? receiveAddress[3] : "");
+            }
+
+            //状态
+            orderExportDetailDTO.setOrderStatus(OrderStatusEnum.valueOf(orderExportDTO.getOrderStatus()).description());
+            orderExportDetailDTO.setPaymentMethod(CharSequenceUtil.isNotBlank(orderExportDTO.getPaymentMethod()) ? PaymentMethodEnum.valueOf(orderExportDTO.getPaymentMethod()).paymentName() : "");
+            orderExportDetailDTO.setClientType(ClientTypeEnum.valueOf(orderExportDTO.getClientType()).value());
+            orderExportDetailDTO.setOrderType(orderExportDTO.getOrderType().equals(OrderTypeEnum.NORMAL.name()) ? "普通订单" : "虚拟订单");
+            orderExportDetailDTO.setAfterSaleStatus(OrderItemAfterSaleStatusEnum.valueOf(orderExportDTO.getAfterSaleStatus()).description());
+
+            //时间
+            orderExportDetailDTO.setCreateTime(DateUtil.formatDateTime(orderExportDTO.getCreateTime()));
+            orderExportDetailDTO.setPaymentTime(DateUtil.formatDateTime(orderExportDTO.getPaymentTime()));
+            orderExportDetailDTO.setLogisticsTime(DateUtil.formatDateTime(orderExportDTO.getLogisticsTime()));
+            orderExportDetailDTO.setCompleteTime(DateUtil.formatDateTime(orderExportDTO.getCompleteTime()));
+            orderExportDetailDTOList.add(orderExportDetailDTO);
+        }
+
+        XSSFWorkbook workbook = new XSSFWorkbook();
+        Sheet sheet = workbook.createSheet("订单列表");
+
+        // 创建表头
+        Row header = sheet.createRow(0);
+        String[] headers = {"主订单编号", "子订单编号", "选购商品", "商品数量", "商品ID", "商品单价", "订单应付金额",
+                "运费", "优惠总金额", "平台优惠", "商家优惠", "商家改价", "支付方式", "收件人", "收件人手机号",
+                "省", "市", "区", "街道", "详细地址", "买家留言", "订单提交时间", "支付完成时间", "来源",
+                "订单状态", "订单类型", "售后状态", "取消原因", "发货时间", "完成时间", "店铺"};
+
+        for (int i = 0; i < headers.length; i++) {
+            Cell cell = header.createCell(i);
+            cell.setCellValue(headers[i]);
+        }
+        // 填充数据
+        for (int i = 0; i < orderExportDetailDTOList.size(); i++) {
+            OrderExportDetailDTO dto = orderExportDetailDTOList.get(i);
+            Row row = sheet.createRow(i + 1);
+            row.createCell(0).setCellValue(dto.getOrderSn());
+            row.createCell(1).setCellValue(dto.getOrderItemSn());
+            row.createCell(2).setCellValue(dto.getGoodsName());
+            row.createCell(3).setCellValue(dto.getNum());
+            row.createCell(4).setCellValue(dto.getGoodsId());
+            row.createCell(5).setCellValue(dto.getUnitPrice()!=null?dto.getUnitPrice():0);
+            row.createCell(6).setCellValue(dto.getFlowPrice()!=null?dto.getFlowPrice():0);
+            row.createCell(7).setCellValue(dto.getFreightPrice()!=null?dto.getFreightPrice():0);
+            row.createCell(8).setCellValue(dto.getDiscountPrice()!=null?dto.getDiscountPrice():0);
+            row.createCell(9).setCellValue(dto.getSiteMarketingCost()!=null?dto.getSiteMarketingCost():0);
+            row.createCell(10).setCellValue(dto.getStoreMarketingCost()!=null?dto.getStoreMarketingCost():0);
+            row.createCell(11).setCellValue(dto.getUpdatePrice()!=null?dto.getUpdatePrice():0);
+            row.createCell(12).setCellValue(dto.getPaymentMethod());
+            row.createCell(13).setCellValue(dto.getConsigneeName());
+            row.createCell(14).setCellValue(dto.getConsigneeMobile());
+            row.createCell(15).setCellValue(dto.getProvince());
+            row.createCell(16).setCellValue(dto.getCity());
+            row.createCell(17).setCellValue(dto.getDistrict());
+            row.createCell(18).setCellValue(dto.getStreet());
+            row.createCell(19).setCellValue(dto.getConsigneeDetail());
+            row.createCell(20).setCellValue(dto.getRemark());
+            row.createCell(21).setCellValue(dto.getCreateTime());
+            row.createCell(22).setCellValue(dto.getPaymentTime());
+            row.createCell(23).setCellValue(dto.getClientType());
+            row.createCell(24).setCellValue(dto.getOrderStatus());
+            row.createCell(25).setCellValue(dto.getOrderType());
+            row.createCell(26).setCellValue(dto.getAfterSaleStatus());
+            row.createCell(27).setCellValue(dto.getCancelReason());
+            row.createCell(28).setCellValue(dto.getLogisticsTime());
+            row.createCell(29).setCellValue(dto.getCompleteTime());
+            row.createCell(30).setCellValue(dto.getStoreName());
+        }
+
+        //修改列宽
+//        sheet.setColumnWidth(0, 30 * 256);
+//        sheet.setColumnWidth(1, 30 * 256);
+//        sheet.setColumnWidth(2, 30 * 256);
+//        sheet.setColumnWidth(3, 8 * 256);
+//        sheet.setColumnWidth(4, 20 * 256);
+//        sheet.setColumnWidth(5, 10 * 256);
+//        sheet.setColumnWidth(6, 10 * 256);
+//        sheet.setColumnWidth(7, 10 * 256);
+//        sheet.setColumnWidth(8, 10 * 256);
+//        sheet.setColumnWidth(9, 10 * 256);
+//        sheet.setColumnWidth(10, 10 * 256);
+//        sheet.setColumnWidth(11, 10 * 256);
+//        sheet.setColumnWidth(12, 10 * 256);
+//        sheet.setColumnWidth(13, 10 * 256);
+//        sheet.setColumnWidth(14, 16 * 256);
+//        sheet.setColumnWidth(15, 10 * 256);
+//        sheet.setColumnWidth(16, 10 * 256);
+//        sheet.setColumnWidth(17, 10 * 256);
+//        sheet.setColumnWidth(18, 10 * 256);
+//        sheet.setColumnWidth(19, 30 * 256);
+//        sheet.setColumnWidth(20, 20 * 256);
+//        sheet.setColumnWidth(21, 20 * 256);
+//        sheet.setColumnWidth(22, 20 * 256);
+//        sheet.setColumnWidth(23, 10 * 256);
+//        sheet.setColumnWidth(24, 10 * 256);
+//        sheet.setColumnWidth(25, 10 * 256);
+//        sheet.setColumnWidth(26, 10 * 256);
+//        sheet.setColumnWidth(27, 20 * 256);
+//        sheet.setColumnWidth(28, 20 * 256);
+//        sheet.setColumnWidth(29, 20 * 256);
+//        sheet.setColumnWidth(30, 20 * 256);
+        return workbook;
     }
 }
